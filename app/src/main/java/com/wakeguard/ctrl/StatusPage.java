@@ -29,7 +29,7 @@ final class StatusPage extends LinearLayout {
     private boolean logExpanded = false;
     private static final int LOG_LINES_COLLAPSED = 6;
 
-    /** 与 StatsPage 保持一致：超过这段时间没落盘就认为统计侧已停 */
+    /** 与 StatsPage 保持一致：超过这段时间没新记录就改中性文案（不代表模块已停） */
     private static final long STATS_STALE_MS = 10 * 60 * 1000L;
 
     StatusPage(MainActivity a) {
@@ -415,6 +415,28 @@ final class StatusPage extends LinearLayout {
     }
 
     /** 粗粒度时长：报告里只需要"大概多久以前"，秒级精度反而喧宾夺主 */
+    /**
+     * hook 自检日志每次 system_server 启动写一行，行首时间就是注入时刻。
+     * 只有它明显早于本次开机，才说明"装了新包没重启"。
+     * 读不到或格式变了时返回 true —— 宁可不报警，也不要凭数据静默误判。
+     */
+    private static boolean moduleBootedThisBoot(String bootLog) {
+        if (bootLog == null || bootLog.trim().isEmpty()) return true;
+        String[] ls = bootLog.trim().split("\n");
+        String line = ls[ls.length - 1].trim();
+        int bar = line.indexOf('|');
+        if (bar < 0) return true;
+        try {
+            Date d = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.ROOT)
+                    .parse(line.substring(0, bar).trim());
+            long bootAt = System.currentTimeMillis() - SystemClock.elapsedRealtime();
+            // 留 10 分钟余量：墙钟被网络校时、深睡计时误差都在范围内
+            return d.getTime() >= bootAt - 10 * 60 * 1000L;
+        } catch (Throwable t) {
+            return true;
+        }
+    }
+
     private static String ago(long ms) {
         if (ms < 0) ms = 0;
         if (ms < 60000L) return "不到 1 分钟";
@@ -468,17 +490,22 @@ final class StatusPage extends LinearLayout {
                         .exec("cat /data/system/wakeguard_hook.log 2>/dev/null");
                 String boot = br.out == null ? "" : br.out.trim();
 
-                // 唤醒统计是否在落盘：文件存在说明 hook 侧统计逻辑已跑起来
+                // 唤醒统计是否在落盘。
+                // 注意不能用 ls -l：参数是绝对路径时最后一列是完整路径，
+                // lastIndexOf(' ') 会把 "/data/system/...txt" 当成"字节数"显示出来。
                 RootShell.Result sf = RootShell.get().exec(
-                        "ls -l /data/system/wakeguard_stats.txt 2>/dev/null");
-                String statsTxt; int statsColor;
+                        "stat -c '%s %Y' /data/system/wakeguard_stats.txt 2>/dev/null");
                 String sl = sf.out == null ? "" : sf.out.trim();
-                if (sl.isEmpty()) {
+                String statsTxt; int statsColor;
+                long fileSize = -1;
+                String[] sf2 = sl.split("\\s+");
+                if (sf2.length >= 2) {
+                    try { fileSize = Long.parseLong(sf2[0]); } catch (Throwable ignored) {}
+                }
+                if (fileSize < 0) {
                     statsTxt = "尚未生成（重启后自动开始）";
                     statsColor = Ui.AMBER;
                 } else {
-                    int sp = sl.lastIndexOf(' ');
-                    String size = sp > 0 ? sl.substring(sp + 1) : "";
                     // 表头给"起始时间/模块版本"，尾部给"最近活跃时间"：
                     // 只读表头会把增量追加的文件误判成停更（表头只在全量重写时更新）
                     RootShell.Result sh = RootShell.get().exec(
@@ -486,15 +513,27 @@ final class StatusPage extends LinearLayout {
                                     + "echo; tail -c 8000 /data/system/wakeguard_stats.txt 2>/dev/null");
                     Stats.Data sd = Stats.parse(sh.out);
                     String ver = sd.modVer.isEmpty() ? " 旧格式" : " 模块 v" + sd.modVer;
-                    if (sd.flushed > 0) {
-                        long age = Math.max(0, System.currentTimeMillis() - sd.flushed);
-                        boolean stale = age > STATS_STALE_MS;
-                        statsTxt = size + " 字节 ·" + ver + " · "
-                                + (stale ? "已停更 " + ago(age) + "，需重启注入" : ago(age) + "前写入");
-                        statsColor = stale ? Ui.RED : Ui.GREEN;
-                    } else {
-                        statsTxt = size + " 字节 ·" + ver + "，无法判断新鲜度，重启一次升级";
+                    String sizeTxt = fileSize + " 字节 ·";
+                    // "需要重启"必须有硬证据：hook 自检不是本轮开机写的，或写入方模块是旧主次版本。
+                    // 数据静默本身不是证据 —— hook 只在有唤醒申请时才落盘，手机睡着时安静十几分钟正是对的。
+                    boolean needReboot = !moduleBootedThisBoot(boot)
+                            || (!sd.modVer.isEmpty() && !Stats.sameMinor(sd.modVer, versionName()));
+                    if (needReboot) {
+                        statsTxt = sizeTxt + ver + " · 本轮开机未注入，需重启手机";
+                        statsColor = Ui.RED;
+                    } else if (sd.flushed <= 0) {
+                        statsTxt = sizeTxt + ver + " · 旧格式，无法判断新鲜度";
                         statsColor = Ui.AMBER;
+                    } else {
+                        long age = Math.max(0, System.currentTimeMillis() - sd.flushed);
+                        if (age > STATS_STALE_MS) {
+                            statsTxt = sizeTxt + ver + " · 最后记录 " + ago(age)
+                                    + "前（期间无唤醒申请）";
+                            statsColor = Ui.SUB;
+                        } else {
+                            statsTxt = sizeTxt + ver + " · " + ago(age) + "前写入";
+                            statsColor = Ui.GREEN;
+                        }
                     }
                 }
 

@@ -51,7 +51,7 @@ final class Hooks {
      * 仍是上一次注入的旧代码，App 看到的却是新界面。把"写数据那一方"的版本
      * 带上，App 一比就知道跑的是不是新代码。
      */
-    static final String MOD_VER = "2.5.4";
+    static final String MOD_VER = "2.5.5";
 
     private static volatile boolean enabled = true;
     /** 观察模式：命中规则只记账不真拦 */

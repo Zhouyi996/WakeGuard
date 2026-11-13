@@ -31,8 +31,9 @@ final class StatsPage extends LinearLayout {
     static final String STATS_FILE = "/data/system/wakeguard_stats.txt";
     private static final int LIMIT = 200;
     /**
-     * 超过这么久没有新记录，就认为写统计的那一方已经停了。
-     * 阈值不能太小：深度休眠时系统可能长时间不申请唤醒锁，那是正常静默而非故障。
+     * 超过这么久没有新记录，就补一句"这段时间无唤醒申请"的中性说明。
+     * 注意这不是故障判定：hook 只在有申请时才落盘，深度休眠时长时间无记录是正常静默；
+     * 模块是否真的没注入，要看写入方模块版本与 App 主次版本是否一致。
      */
     private static final long STALE_MS = 10 * 60 * 1000L;
 
@@ -212,9 +213,10 @@ final class StatsPage extends LinearLayout {
                 sb.append(" · 最后写入 ").append(stamp(data.flushed, now))
                         .append("（").append(ago(age)).append("前）");
                 if (age > STALE_MS) {
-                    color = Ui.RED;
-                    sb.append("\n已经 ").append(ago(age)).append(" 没有新记录 —— 写统计的模块已停，")
-                            .append("装完新包必须重启手机才会重新注入");
+                    // 没新记录通常只是"这段时间没有唤醒申请"（手机静置/深睡时的正常状态）。
+                    // hook 只在有申请时才落盘，不能据此断言模块已停、更不能让用户去重启清数据；
+                    // 真正需要重启的证据是下面的模块版本不一致。
+                    sb.append("\n").append(ago(age)).append(" 无新唤醒申请 · 静置时的正常状态");
                 }
             }
 

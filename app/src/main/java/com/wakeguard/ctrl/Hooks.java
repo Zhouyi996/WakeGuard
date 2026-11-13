@@ -51,7 +51,7 @@ final class Hooks {
      * 仍是上一次注入的旧代码，App 看到的却是新界面。把"写数据那一方"的版本
      * 带上，App 一比就知道跑的是不是新代码。
      */
-    static final String MOD_VER = "2.5.3";
+    static final String MOD_VER = "2.5.4";
 
     private static volatile boolean enabled = true;
     /** 观察模式：命中规则只记账不真拦 */
@@ -638,19 +638,25 @@ final class Hooks {
                                     kind = "TAG";
                                 }
                             }
-                            if (kind == null) return;
+                            IBinder token = firstBinder(p.args);
+                            if (kind == null) {
+                                // 没命中任何规则：锁会被真正持有，登记起点用于算持锁时长
+                                noteHeldStart(token, statUid, statKey(tag), statScreenOn);
+                                return;
+                            }
                             if (!timingOk(uid)) {
                                 // 规则命中了但被放行：排查"为什么没拦住"时必须看到这条
                                 dbg("s" + uid + kind + tag,
                                         "SKIP-WL uid=" + uid + " tag=" + tag + " rule=" + kind
                                                 + " 因时机/放行窗口放行 screen="
                                                 + (statScreenOn ? "on" : "off"));
+                                noteHeldStart(token, statUid, statKey(tag), statScreenOn);
                                 return;
                             }
 
-                            IBinder token = firstBinder(p.args);
                             if (observe) {
                                 // 观察模式：记账、写日志，但不改系统行为
+                                noteHeldStart(token, statUid, statKey(tag), statScreenOn);
                                 noteStatBlocked("WL", statUid, statKey(tag));
                                 dbg("d" + uid + kind + tag,
                                         "DRY-BLOCK-WL uid=" + uid + " tag=" + tag + " rule=" + kind
@@ -694,7 +700,13 @@ final class Hooks {
                     @Override
                     protected void beforeHookedMethod(MethodHookParam p) {
                         try {
-                            if (consumeSkipped(firstBinder(p.args))) p.setResult(null);
+                            IBinder token = firstBinder(p.args);
+                            if (consumeSkipped(token)) {
+                                p.setResult(null);
+                                return;
+                            }
+                            // 被拦掉的锁不会走到这里（acquire 时就没登记），所以能对上号的就是真持锁
+                            noteHeldEnd(token);
                         } catch (Throwable t) {
                             log("wl-release error: " + t);
                         }
@@ -956,6 +968,27 @@ final class Hooks {
             new java.util.concurrent.ConcurrentHashMap<String, int[]>();
     private static final java.util.concurrent.ConcurrentHashMap<String, Long> statLast =
             new java.util.concurrent.ConcurrentHashMap<String, Long>();
+    /**
+     * 每个 tag 的持锁总时长（毫秒）：[0]=全部 [1]=熄屏期间。
+     * 次数只说明"申请了多少回"，真正让人无法休眠的是"累计持有多久"。
+     */
+    private static final java.util.concurrent.ConcurrentHashMap<String, long[]> statHeld =
+            new java.util.concurrent.ConcurrentHashMap<String, long[]>();
+    /** 正在持有的锁：token → 起始状态。acquire 时登记，release 时结算成时长。 */
+    private static final java.util.concurrent.ConcurrentHashMap<IBinder, Held> held =
+            new java.util.concurrent.ConcurrentHashMap<IBinder, Held>();
+    /** 24 小时分布（按本地小时落桶），用于画唤醒曲线；重启后重新计数 */
+    private static final int[] hourlyWl = new int[24];
+    private static final int[] hourlyAl = new int[24];
+    private static final Object hourlyLock = new Object();
+
+    private static final class Held {
+        String key;
+        long start;
+        boolean startOff;
+        int depth;
+    }
+
     /** 自上次落盘以来有变化的 key，只追加这些，避免每次重写整个文件 */
     private static final Set<String> statDirty = java.util.Collections.newSetFromMap(
             new java.util.concurrent.ConcurrentHashMap<String, Boolean>());
@@ -963,6 +996,7 @@ final class Hooks {
     private static volatile long statSince = 0;
     private static volatile long statFlushAt = 0;
     private static long statPruneAt = 0;
+    private static long statHourlyAt = 0;                         // 上次写 24 小时分布的时间
     private static boolean statWriteFailed = false;
     private static boolean statHeaderWritten = false;             // 本进程是否已写过表头
 
@@ -989,6 +1023,12 @@ final class Hooks {
         if (statSince == 0) statSince = System.currentTimeMillis();
         statDirty.add(k);
 
+        int hr = hourOfDay();
+        synchronized (hourlyLock) {
+            if ("AL".equals(kind)) hourlyAl[hr]++;
+            else hourlyWl[hr]++;
+        }
+
         long now = System.currentTimeMillis();
         if (now - statFlushAt >= 20000L) flushStats();
         else if (now - statPruneAt >= 60000L) pruneStats(now);
@@ -1008,6 +1048,66 @@ final class Hooks {
         statDirty.add(k);
     }
 
+    /** 当前本地小时（0-23） */
+    private static int hourOfDay() {
+        long t = System.currentTimeMillis();
+        long local = t + TZ.getOffset(t);
+        return (int) ((local / 3600000L) % 24L);
+    }
+
+    /**
+     * 申请被放行时登记，release 时结算。
+     *
+     * 同一个 token 可能被重复 acquire（PMS 内部按引用计数），所以这里也维护 depth：
+     * 第一次 acquire 记起点，最后一次 release 才算结束，否则会把长持锁切成很多短片段。
+     */
+    private static void noteHeldStart(IBinder token, int uid, String key, boolean screenOnNow) {
+        if (token == null || uid < 0) return;
+        Held h = held.get(token);
+        if (h != null) {
+            h.depth++;
+            return;
+        }
+        h = new Held();
+        h.key = "WL" + SEP + uid + SEP + key;
+        h.start = android.os.SystemClock.elapsedRealtime();
+        h.startOff = !screenOnNow;
+        h.depth = 1;
+        held.put(token, h);
+        // 兜底：正常路径下 token 一定会被 release 掉，这里只防异常泄漏
+        if (held.size() > 4096) held.clear();
+    }
+
+    private static void noteHeldEnd(IBinder token) {
+        if (token == null) return;
+        Held h = held.get(token);
+        if (h == null) return;
+        if (--h.depth > 0) return;
+        held.remove(token);
+
+        long dur = android.os.SystemClock.elapsedRealtime() - h.start;
+        if (dur <= 0) return;
+        // 异常 token 或时钟跳变时别把总时长算成几天
+        if (dur > 12L * 3600L * 1000L) dur = 12L * 3600L * 1000L;
+
+        // 熄屏时长按"申请时熄屏且释放时仍熄屏"计算：
+        // 中途亮屏的那段会被算成亮屏，宁可少算也不虚报。
+        boolean countedOff = h.startOff && !screenOn();
+
+        long[] v = statHeld.get(h.key);
+        if (v == null) {
+            long[] fresh = new long[2];
+            long[] prev = statHeld.putIfAbsent(h.key, fresh);
+            v = prev == null ? fresh : prev;
+        }
+        synchronized (v) {
+            v[0] += dur;
+            if (countedOff) v[1] += dur;
+        }
+        statLast.put(h.key, Long.valueOf(System.currentTimeMillis()));
+        statDirty.add(h.key);
+    }
+
     /**
      * 条目淘汰：先把 12 小时没动静的清掉，还不够就按总量从低往高扔。
      * 不淘汰的话，一个跑了一个月的机器上 key 会涨到几万条，且永远不下降。
@@ -1022,6 +1122,7 @@ final class Hooks {
                 statCnt.remove(k);
                 statLast.remove(k);
                 statDirty.remove(k);
+                statHeld.remove(k);
             }
         }
         if (statCnt.size() > STAT_MAX_KEYS) {
@@ -1039,6 +1140,7 @@ final class Hooks {
                 statCnt.remove(k);
                 statLast.remove(k);
                 statDirty.remove(k);
+                statHeld.remove(k);
             }
         }
         dbg(null, "STATS PRUNE " + before + " -> " + statCnt.size());
@@ -1051,13 +1153,42 @@ final class Hooks {
         return s.length() > 64 ? s.substring(0, 64) : s;
     }
 
-    private static String statRow(String key, int[] c, long last) {
-        return key + SEP + c[0] + SEP + c[1] + SEP + c[2] + SEP + last + "\n";
+    /**
+     * 行格式（分隔符 \u0001）：
+     *   key = <WL|AL>\u0001<uid>\u0001<tag>
+     *   key\u0001亮屏次数\u0001熄屏次数\u0001被拦次数\u0001最后活跃ms\u0001持锁总时长ms\u0001熄屏持锁时长ms
+     */
+    private static String statRow(String key, int[] c, long[] h, long last) {
+        int on = c == null ? 0 : c[0];
+        int off = c == null ? 0 : c[1];
+        int blk = c == null ? 0 : c[2];
+        long ht = h == null ? 0L : h[0];
+        long ho = h == null ? 0L : h[1];
+        return key + SEP + on + SEP + off + SEP + blk + SEP + last
+                + SEP + ht + SEP + ho + "\n";
+    }
+
+    /** 24 小时分布单独一行，每次落盘整行覆盖；解析时后者胜出 */
+    private static String hourlyRow() {
+        StringBuilder sb = new StringBuilder(160);
+        sb.append('H').append(SEP);
+        synchronized (hourlyLock) {
+            for (int i = 0; i < 24; i++) {
+                if (i > 0) sb.append(',');
+                sb.append(hourlyWl[i]);
+            }
+            sb.append(SEP);
+            for (int i = 0; i < 24; i++) {
+                if (i > 0) sb.append(',');
+                sb.append(hourlyAl[i]);
+            }
+        }
+        return sb.append('\n').toString();
     }
 
     private static String statHeader() {
         long since = statSince == 0 ? System.currentTimeMillis() : statSince;
-        return "#" + SEP + since + SEP + 2 + SEP + MOD_VER + SEP
+        return "#" + SEP + since + SEP + 3 + SEP + MOD_VER + SEP
                 + System.currentTimeMillis() + "\n";
     }
 
@@ -1082,17 +1213,27 @@ final class Hooks {
             StringBuilder sb = new StringBuilder(full ? 16384 : 512);
             if (full) {
                 sb.append(statHeader());
-                for (Map.Entry<String, int[]> e : statCnt.entrySet()) {
-                    Long last = statLast.get(e.getKey());
-                    sb.append(statRow(e.getKey(), e.getValue(),
+                Set<String> allKeys = new HashSet<String>(statCnt.keySet());
+                allKeys.addAll(statHeld.keySet());
+                for (String k : allKeys) {
+                    Long last = statLast.get(k);
+                    sb.append(statRow(k, statCnt.get(k), statHeld.get(k),
                             last == null ? 0L : last.longValue()));
                 }
+                sb.append(hourlyRow());
+                statHourlyAt = now;
             } else {
                 for (String k : statDirty) {
                     int[] c = statCnt.get(k);
-                    if (c == null) continue;
+                    long[] h = statHeld.get(k);
+                    if (c == null && h == null) continue;
                     Long last = statLast.get(k);
-                    sb.append(statRow(k, c, last == null ? 0L : last.longValue()));
+                    sb.append(statRow(k, c, h, last == null ? 0L : last.longValue()));
+                }
+                // 曲线是整体覆盖的，20 秒写一次太浪费：5 分钟补一行就够，粒度本来就是小时
+                if (now - statHourlyAt >= 300000L) {
+                    sb.append(hourlyRow());
+                    statHourlyAt = now;
                 }
             }
             statDirty.clear();

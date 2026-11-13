@@ -13,8 +13,10 @@ import java.util.Map;
  * 格式：字段用 \u0001 分隔
  *   #\u0001<统计起始ms>\u0001<格式版本>\u0001<模块版本>\u0001<最后写入ms>
  *   <WL|AL>\u0001<uid>\u0001<tag>\u0001<亮屏>\u0001<熄屏>\u0001<被拦>\u0001<最后一次ms>
+ *        \u0001<持锁总时长ms>\u0001<熄屏持锁时长ms>        ← 格式 3 起
+ *   H\u0001<24 个锁计数>\u0001<24 个闹钟计数>              ← 每 5 分钟覆盖一次
  *
- * 格式版本 1 的表头只有前两项（没有模块版本和最后写入时间），解析时按字段个数缺省。
+ * 旧格式缺的字段按缺省处理，所以老文件仍然能读，只是没有持锁时长和曲线。
  */
 final class Stats {
 
@@ -24,6 +26,8 @@ final class Stats {
         String key = "";      // 锁的 tag，闹钟固定为 alarm
         int on, off, blocked;
         long last;
+        /** 持锁总时长（毫秒）；闹钟没有这个概念，恒为 0 */
+        long heldMs, heldOffMs;
 
         int total() { return on + off; }
     }
@@ -32,6 +36,7 @@ final class Stats {
         int uid;
         int wlOn, wlOff, wlBlocked;
         int alOn, alOff, alBlocked;
+        long wlHeldMs, wlHeldOffMs;
         long last;
         final List<Item> items = new ArrayList<Item>();
 
@@ -40,6 +45,8 @@ final class Stats {
         int total() { return wlTotal() + alTotal(); }
         int sleepTotal() { return wlOff + alOff; }
         int blocked() { return wlBlocked + alBlocked; }
+        long heldMs() { return wlHeldMs; }
+        long heldOffMs() { return wlHeldOffMs; }
     }
 
     static final class Data {
@@ -48,9 +55,26 @@ final class Stats {
         long flushed;
         /** 写这份数据的模块版本，空表示旧格式 */
         String modVer = "";
-        /** 表头格式版本：1=旧（无新鲜度信息）2=带模块版本与最后写入时间 */
+        /** 表头格式版本：1=旧（无新鲜度信息）2=带模块版本与最后写入时间 3=带持锁时长与 24 小时分布 */
         int fmt = 1;
+        /** 24 小时分布：索引是本地小时 */
+        final int[] hourlyWl = new int[24];
+        final int[] hourlyAl = new int[24];
+        /** 文件里有没有 24 小时分布（旧模块写的没有） */
+        boolean hasHourly;
         final List<App> apps = new ArrayList<App>();
+
+        int hourlyTotal() {
+            int n = 0;
+            for (int i = 0; i < 24; i++) n += hourlyWl[i];
+            return n;
+        }
+
+        int hourlyPeak() {
+            int n = 0;
+            for (int i = 0; i < 24; i++) if (hourlyWl[i] > n) n = hourlyWl[i];
+            return n;
+        }
 
         int appCount() { return apps.size(); }
 
@@ -85,6 +109,13 @@ final class Stats {
         return j < 0 ? v : v.substring(0, j);
     }
 
+    private static void fillHourly(int[] dst, String csv) {
+        String[] p = csv.split(",");
+        for (int i = 0; i < 24 && i < p.length; i++) {
+            try { dst[i] = Integer.parseInt(p[i].trim()); } catch (Throwable ignored) {}
+        }
+    }
+
     static Data parse(String raw) {
         Data d = new Data();
         if (raw == null) return d;
@@ -109,6 +140,16 @@ final class Stats {
                 }
                 continue;
             }
+            if (t.charAt(0) == 'H') {
+                // H␁<24 个逗号分隔的锁计数>␁<24 个闹钟计数>；追加模式下会有多行，最后一行最全
+                String[] h = t.split("\u0001");
+                if (h.length >= 3) {
+                    fillHourly(d.hourlyWl, h[1]);
+                    fillHourly(d.hourlyAl, h[2]);
+                    d.hasHourly = true;
+                }
+                continue;
+            }
             String[] f = t.split("\u0001");
             if (f.length < 7) continue;
             Item it = new Item();
@@ -122,6 +163,12 @@ final class Stats {
                 it.last = Long.parseLong(f[6].trim());
             } catch (Throwable bad) {
                 continue;
+            }
+            if (f.length >= 9) {
+                try {
+                    it.heldMs = Long.parseLong(f[7].trim());
+                    it.heldOffMs = Long.parseLong(f[8].trim());
+                } catch (Throwable ignored) {}
             }
             if (it.key.isEmpty()) it.key = "(未命名)";
             if ("AL".equals(it.kind)) it.key = "alarm";
@@ -144,6 +191,8 @@ final class Stats {
                 a.wlOn += it.on;
                 a.wlOff += it.off;
                 a.wlBlocked += it.blocked;
+                a.wlHeldMs += it.heldMs;
+                a.wlHeldOffMs += it.heldOffMs;
             }
             if (it.last > a.last) a.last = it.last;
             if (it.last > d.flushed) d.flushed = it.last;

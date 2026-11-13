@@ -24,7 +24,7 @@ final class StatusPage extends LinearLayout {
     private final MainActivity act;
     private final Rules rules;
     private final TextView rootVal, modVal, prefVal, countVal, logView;
-    private TextView statsVal, allowVal, logToggle;
+    private TextView statsVal, allowVal, dozeVal, logToggle;
     /** 事件日志默认收起来：一屏能看全，需要时再展开 */
     private boolean logExpanded = false;
     private static final int LOG_LINES_COLLAPSED = 6;
@@ -52,6 +52,7 @@ final class StatusPage extends LinearLayout {
         countVal = addKv(env, "已配置规则");
         statsVal = addKv(env, "唤醒统计");
         allowVal = addKv(env, "临时放行");
+        dozeVal = addKv(env, "Doze 休眠");
         body.addView(env, Ui.lp(ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT));
 
@@ -317,6 +318,13 @@ final class StatusPage extends LinearLayout {
                 sb.append("开机时长: ").append(up / 3600000L).append(" 时 ")
                   .append((up / 60000L) % 60L).append(" 分\n");
 
+                // Doze 状态决定"拦了之后到底有没有进休眠"，是复盘消息漏收/正常收到的关键
+                RootShell.Result dzr = RootShell.get().exec("dumpsys deviceidle 2>/dev/null");
+                String dzState = dumpValue(dzr.out, "mState=");
+                String dzLight = dumpValue(dzr.out, "mLightState=");
+                sb.append("Doze 状态: ").append(dzState == null ? "(读不到)" : dzState)
+                  .append(" / 浅休眠: ").append(dzLight == null ? "(读不到)" : dzLight).append('\n');
+
                 sb.append("\n=== 规则配置 ===\n");
                 try { sb.append(rules.describe(act.getPackageManager())); }
                 catch (Throwable t) { sb.append("(读取失败: ").append(t).append(")\n"); }
@@ -344,6 +352,12 @@ final class StatusPage extends LinearLayout {
                 sb.append("App 版本: v").append(av).append('\n');
                 sb.append("记录规模: ").append(sd.appCount()).append(" 个应用 / ")
                   .append(sd.totalEvents()).append(" 次申请 / 已拦 ").append(sd.totalBlocked()).append('\n');
+                long heldAll = 0, heldOff = 0;
+                for (Stats.App a : sd.apps) { heldAll += a.heldMs(); heldOff += a.heldOffMs(); }
+                if (heldAll > 0) {
+                    sb.append("持锁总时长: ").append(heldAll / 60000L).append(" 分钟（其中熄屏 ")
+                      .append(heldOff / 60000L).append(" 分钟）\n");
+                }
                 if (sd.flushed > 0 && nowMs - sd.flushed > STATS_STALE_MS) {
                     sb.append("！数据已停更 ").append(ago(nowMs - sd.flushed))
                       .append("：写统计的模块没在运行，下面的事件日志不能代表现在的行为\n");
@@ -465,8 +479,11 @@ final class StatusPage extends LinearLayout {
                 } else {
                     int sp = sl.lastIndexOf(' ');
                     String size = sp > 0 ? sl.substring(sp + 1) : "";
+                    // 表头给"起始时间/模块版本"，尾部给"最近活跃时间"：
+                    // 只读表头会把增量追加的文件误判成停更（表头只在全量重写时更新）
                     RootShell.Result sh = RootShell.get().exec(
-                            "head -c 160 /data/system/wakeguard_stats.txt 2>/dev/null");
+                            "head -c 200 /data/system/wakeguard_stats.txt 2>/dev/null; "
+                                    + "echo; tail -c 8000 /data/system/wakeguard_stats.txt 2>/dev/null");
                     Stats.Data sd = Stats.parse(sh.out);
                     String ver = sd.modVer.isEmpty() ? " 旧格式" : " 模块 v" + sd.modVer;
                     if (sd.flushed > 0) {
@@ -479,6 +496,28 @@ final class StatusPage extends LinearLayout {
                         statsTxt = size + " 字节 ·" + ver + "，无法判断新鲜度，重启一次升级";
                         statsColor = Ui.AMBER;
                     }
+                }
+
+                // Doze 状态：解释"我明明拦了，为什么还是收到了消息"最直接的一条
+                RootShell.Result dz = RootShell.get().exec("dumpsys deviceidle 2>/dev/null");
+                String dozeTxt; int dozeColor;
+                String dstate = dumpValue(dz.out, "mState=");
+                if (dstate == null) {
+                    dozeTxt = "读不到（需要 root）";
+                    dozeColor = Ui.SUB;
+                } else if ("IDLE_MAINTENANCE".equals(dstate)) {
+                    dozeTxt = "维护窗口放行中 · " + dstate;
+                    dozeColor = Ui.AMBER;
+                } else if ("IDLE".equals(dstate)) {
+                    dozeTxt = "深度休眠中 · " + dstate;
+                    dozeColor = Ui.GREEN;
+                } else if ("IDLE_PENDING".equals(dstate) || "SENSING".equals(dstate)
+                        || "LOCATING".equals(dstate)) {
+                    dozeTxt = "准备进入休眠 · " + dstate;
+                    dozeColor = Ui.AMBER;
+                } else {
+                    dozeTxt = "未休眠 · " + dstate;
+                    dozeColor = Ui.SUB;
                 }
 
                 RootShell.Result lg = RootShell.get()
@@ -521,6 +560,8 @@ final class StatusPage extends LinearLayout {
                                 + " 之前全部放行"
                         : "未放行";
                 final int alColor = allowAt > System.currentTimeMillis() ? Ui.AMBER : Ui.TEXT;
+                final String dzTxt = dozeTxt;
+                final int dzColor = dozeColor;
                 act.ui.post(new Runnable() {
                     public void run() {
                         rootVal.setText(rt);
@@ -539,12 +580,30 @@ final class StatusPage extends LinearLayout {
                             allowVal.setText(alTxt);
                             allowVal.setTextColor(alColor);
                         }
+                        if (dozeVal != null) {
+                            dozeVal.setText(dzTxt);
+                            dozeVal.setTextColor(dzColor);
+                        }
                         logView.setText(lgt);
                         setLogExpanded(logExpanded);
                     }
                 });
             }
         }).start();
+    }
+
+    /** 从 dumpsys 输出里取 "key=value" 这样的行；只取第一个空格前的值（同一行可能还跟着别的字段） */
+    private static String dumpValue(String out, String key) {
+        if (out == null) return null;
+        for (String line : out.split("\n")) {
+            String t = line.trim();
+            if (!t.startsWith(key)) continue;
+            String v = t.substring(key.length()).trim();
+            int sp = v.indexOf(' ');
+            if (sp > 0) v = v.substring(0, sp);
+            return v;
+        }
+        return null;
     }
 
     /** 把冗长的自检行压成"时间 · 3 项拦截"，避免在窄屏上折成好几行 */

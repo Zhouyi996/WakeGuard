@@ -44,6 +44,8 @@ final class StatsPage extends LinearLayout {
     private final Adapter adapter = new Adapter();
     private final List<Stats.App> rows = new ArrayList<Stats.App>();
     private final Map<Integer, String> labelCache = new HashMap<Integer, String>();
+    private final TextView chartNote;
+    private final HourChart chart;
     private String appVer;
 
     private Stats.Data data = new Stats.Data();
@@ -120,6 +122,25 @@ final class StatsPage extends LinearLayout {
 
         addView(top, Ui.lp(ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT));
+
+        // 24 小时曲线：一眼看出"凌晨几点有个尖峰"，比翻列表快得多
+        LinearLayout chartCard = Ui.card(a);
+        chartCard.setPadding(Ui.dp(a, 14), Ui.dp(a, 12), Ui.dp(a, 14), Ui.dp(a, 10));
+        LinearLayout chartHead = Ui.row(a, Gravity.CENTER_VERTICAL);
+        chartHead.addView(Ui.text(a, "24 小时唤醒曲线", 13, Ui.TEXT, true),
+                Ui.lp(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        chartNote = Ui.text(a, "", 10.5f, Ui.SUB, false);
+        chartHead.addView(chartNote);
+        chartCard.addView(chartHead);
+        chart = new HourChart(a);
+        chartCard.addView(chart, Ui.lp(ViewGroup.LayoutParams.MATCH_PARENT, Ui.dp(a, 104)));
+
+        LinearLayout.LayoutParams cLp = Ui.lp(ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT);
+        cLp.leftMargin = Ui.dp(a, 16);
+        cLp.rightMargin = Ui.dp(a, 16);
+        cLp.topMargin = Ui.dp(a, 6);
+        addView(chartCard, cLp);
 
         list = new ListView(a);
         list.setDivider(null);
@@ -208,6 +229,72 @@ final class StatsPage extends LinearLayout {
         }
         info.setText(head);
         info.setTextColor(color);
+
+        if (data.hasHourly && data.hourlyTotal() > 0) {
+            chartNote.setText("锁 · 共 " + data.hourlyTotal() + " 次 · 峰值 "
+                    + data.hourlyPeak() + "/时");
+        } else {
+            chartNote.setText(data.appCount() > 0 ? "等待分布数据（模块 2.5.4+）" : "");
+        }
+        chart.invalidate();
+    }
+
+    /** 24 根柱子的自绘图表，不引图表库；小时标签只标 0/6/12/18/23 避免拥挤 */
+    private final class HourChart extends android.view.View {
+        private final android.graphics.Paint p = new android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG);
+
+        HourChart(android.content.Context c) {
+            super(c);
+        }
+
+        @Override
+        protected void onDraw(android.graphics.Canvas cv) {
+            int w = getWidth(), h = getHeight();
+            if (w <= 0 || h <= 0) return;
+
+            int labelH = Ui.dp(act, 13);
+            int padTop = Ui.dp(act, 4);
+            int plotH = h - labelH - padTop;
+            if (plotH <= 0) return;
+
+            int gap = Math.max(1, Ui.dp(act, 1.5f));
+            float bw = (w - (float) gap * 23f) / 24f;
+
+            int max = 1;
+            for (int i = 0; i < 24; i++) if (data.hourlyWl[i] > max) max = data.hourlyWl[i];
+
+            p.setTextSize(Ui.dp(act, 9));
+            for (int i = 0; i < 24; i++) {
+                int v = data.hourlyWl[i];
+                float bh = plotH * (v / (float) max);
+                if (v > 0 && bh < Ui.dp(act, 2)) bh = Ui.dp(act, 2);
+                if (bh <= 0) continue;
+                float x = i * (bw + gap);
+                float bottom = padTop + plotH;
+                p.setColor(Ui.alpha(Ui.ACCENT, i == nowHour() ? 1f : 0.62f));
+                cv.drawRoundRect(x, bottom - bh, x + bw, bottom, bw / 2.2f, bw / 2.2f, p);
+            }
+
+            p.setColor(Ui.LINE);
+            cv.drawRect(0, padTop + plotH, w, padTop + plotH + Math.max(1, Ui.dp(act, 0.7f)), p);
+
+            p.setColor(Ui.SUB);
+            int[] marks = {0, 6, 12, 18, 23};
+            for (int i : marks) {
+                String s = String.valueOf(i);
+                float tw = p.measureText(s);
+                float cx = i * (bw + gap) + bw / 2f - tw / 2f;
+                if (cx < 0) cx = 0;
+                if (cx > w - tw) cx = w - tw;
+                cv.drawText(s, cx, h - Ui.dp(act, 2), p);
+            }
+        }
+    }
+
+    private static int nowHour() {
+        long t = System.currentTimeMillis();
+        long local = t + java.util.TimeZone.getDefault().getOffset(t);
+        return (int) ((local / 3600000L) % 24L);
     }
 
     /** 同一天只显示时分，跨天才带日期 */
@@ -319,12 +406,16 @@ final class StatsPage extends LinearLayout {
                 awake.setGravity(Gravity.END);
                 awake.setPadding(0, Ui.dp(act, 3), 0, 0);
                 right.addView(awake);
+                TextView held = Ui.text(act, "", 10.5f, Ui.AMBER, false);
+                held.setGravity(Gravity.END);
+                held.setPadding(0, Ui.dp(act, 3), 0, 0);
+                right.addView(held);
                 card.addView(right);
 
                 wrap.addView(card, Ui.lp(ViewGroup.LayoutParams.MATCH_PARENT,
                         ViewGroup.LayoutParams.WRAP_CONTENT));
 
-                h = new ViewHolder(badge, name, sub, sleep, awake);
+                h = new ViewHolder(badge, name, sub, sleep, awake, held);
                 wrap.setTag(h);
                 convert = wrap;
             } else {
@@ -346,6 +437,16 @@ final class StatsPage extends LinearLayout {
                     : "亮屏 " + (a.total() - a.sleepTotal()));
             h.awake.setTextColor(a.blocked() > 0 ? Ui.PURPLE : Ui.SUB);
 
+            // 次数之外再给一个"到底被占了多久"：这才是真正影响待机的量
+            long ho = a.heldOffMs(), ht = a.heldMs();
+            if (ho > 0 || ht > 0) {
+                h.held.setVisibility(View.VISIBLE);
+                h.held.setText(ho > 0 ? "熄屏持锁 " + Ui.fmtMs(ho) : "持锁 " + Ui.fmtMs(ht));
+                h.held.setTextColor(ho > 0 ? Ui.AMBER : Ui.SUB);
+            } else {
+                h.held.setVisibility(View.GONE);
+            }
+
             final Stats.App item = a;
             convert.setOnClickListener(new View.OnClickListener() {
                 public void onClick(View v) { showDetail(item); }
@@ -355,9 +456,9 @@ final class StatsPage extends LinearLayout {
     }
 
     private static final class ViewHolder {
-        final TextView badge, name, sub, sleep, awake;
-        ViewHolder(TextView b, TextView n, TextView s, TextView sl, TextView aw) {
-            badge = b; name = n; sub = s; sleep = sl; awake = aw;
+        final TextView badge, name, sub, sleep, awake, held;
+        ViewHolder(TextView b, TextView n, TextView s, TextView sl, TextView aw, TextView hd) {
+            badge = b; name = n; sub = s; sleep = sl; awake = aw; held = hd;
         }
     }
 
@@ -449,10 +550,14 @@ final class StatsPage extends LinearLayout {
         LinearLayout box = Ui.col(act);
         box.setPadding(Ui.dp(act, 18), Ui.dp(act, 10), Ui.dp(act, 18), Ui.dp(act, 4));
 
-        TextView head = Ui.text(act,
-                "熄屏 " + app.sleepTotal() + " 次 · 亮屏 " + (app.total() - app.sleepTotal())
-                        + " 次" + (app.blocked() > 0 ? " · 已拦 " + app.blocked() + " 次" : ""),
-                12, Ui.SUB, false);
+        StringBuilder hd = new StringBuilder();
+        hd.append("熄屏 ").append(app.sleepTotal()).append(" 次 · 亮屏 ")
+                .append(app.total() - app.sleepTotal()).append(" 次");
+        if (app.blocked() > 0) hd.append(" · 已拦 ").append(app.blocked()).append(" 次");
+        if (app.heldOffMs() > 0) hd.append(" · 熄屏持锁 ").append(Ui.fmtMs(app.heldOffMs()));
+        else if (app.heldMs() > 0) hd.append(" · 持锁 ").append(Ui.fmtMs(app.heldMs()));
+
+        TextView head = Ui.text(act, hd.toString(), 12, Ui.SUB, false);
         box.addView(head);
         TextView hint = Ui.text(act,
                 "被拦掉的申请也计入——它说明这个应用一直在尝试唤醒。", 11, Ui.SUB, false);
@@ -471,8 +576,12 @@ final class StatsPage extends LinearLayout {
             k.setSingleLine(true);
             k.setEllipsize(android.text.TextUtils.TruncateAt.MIDDLE);
             col.addView(k);
-            TextView d = Ui.text(act, "熄屏 " + it.off + " · 亮屏 " + it.on
-                    + (it.blocked > 0 ? " · 已拦 " + it.blocked : ""), 11, Ui.SUB, false);
+            StringBuilder ds = new StringBuilder();
+            ds.append("熄屏 ").append(it.off).append(" · 亮屏 ").append(it.on);
+            if (it.blocked > 0) ds.append(" · 已拦 ").append(it.blocked);
+            if (it.heldOffMs > 0) ds.append(" · 持锁 ").append(Ui.fmtMs(it.heldOffMs));
+            else if (it.heldMs > 0) ds.append(" · 持锁 ").append(Ui.fmtMs(it.heldMs));
+            TextView d = Ui.text(act, ds.toString(), 11, Ui.SUB, false);
             d.setPadding(0, Ui.dp(act, 3), 0, 0);
             col.addView(d);
             row.addView(col, Ui.lp(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));

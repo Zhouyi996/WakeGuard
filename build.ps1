@@ -26,8 +26,8 @@ param(
     [string]$Jdk = $env:JAVA_HOME,
     [string]$ApiJar = "",
     [string]$Python = "python",
-    [string]$VersionName = "2.5.3",
-    [int]$VersionCode = 20503
+    [string]$VersionName = "2.5.4",
+    [int]$VersionCode = 20504
 )
 
 $ErrorActionPreference = "Stop"

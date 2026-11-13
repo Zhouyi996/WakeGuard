@@ -231,8 +231,9 @@ final class StatsPage extends LinearLayout {
         info.setTextColor(color);
 
         if (data.hasHourly && data.hourlyTotal() > 0) {
+            // 分布是整行覆盖的快照，hook 侧每 5 分钟才补一行，数字会略滞后于实时申请量
             chartNote.setText("锁 · 共 " + data.hourlyTotal() + " 次 · 峰值 "
-                    + data.hourlyPeak() + "/时");
+                    + data.hourlyPeak() + "/时 · 5 分钟快照");
         } else {
             chartNote.setText(data.appCount() > 0 ? "等待分布数据（模块 2.5.4+）" : "");
         }

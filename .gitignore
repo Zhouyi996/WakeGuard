@@ -1,0 +1,22 @@
+# 构建产物
+/build/
+
+# 签名材料（build.ps1 首次运行会自动生成临时 debug key，不要提交）
+debug.keystore
+*.keystore
+*.jks
+
+# 仓库根目录的历史 APK 与增量签名文件；正式包统一放 release/
+/*.apk
+/*.apk.idsig
+*.idsig
+
+# 开发期截图（不进仓库）
+/screenshots/
+
+# 编辑器 / 系统文件
+.idea/
+*.iml
+.vscode/
+.DS_Store
+Thumbs.db

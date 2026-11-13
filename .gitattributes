@@ -1,0 +1,8 @@
+# 统一换行：源码用 LF，PowerShell 脚本保持 CRLF（Windows 上更稳）
+* text=auto eol=lf
+*.ps1 text eol=crlf
+
+# 二进制，不做任何换行转换
+*.jar binary
+*.png binary
+*.apk binary
